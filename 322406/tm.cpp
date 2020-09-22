@@ -124,8 +124,8 @@ public:
 
     ~stm_log_bloc()
     {
-        delete[] r_value;
-        delete[] w_value;
+        // delete[] r_value;
+        // delete[] w_value;
     }
 
     bool contains(char *ptr) const
@@ -305,9 +305,9 @@ public:
     void read(transaction *tx, const char *from, char *to, size_t len)
     {
         auto it = _blocks.lower_bound(from);
-        if (it->second->get_mem() > from)
+        if (it == _blocks.end())
         {
-            std::cout << "what\n";
+            std::cout << "oh noz\n";
         }
         tx->read(it->second, from, to, len);
     }
@@ -315,9 +315,9 @@ public:
     void write(transaction *tx, const char *from, char *to, size_t len)
     {
         auto it = _blocks.lower_bound(to);
-        if (it->second->get_mem() > to)
+        if (it == _blocks.end())
         {
-            std::cout << "what\n";
+            std::cout << "oh noz\n";
         }
         tx->write(it->second, from, to, len);
     }
@@ -370,7 +370,9 @@ void tm_destroy(shared_t shared) noexcept
 void *tm_start(shared_t shared) noexcept
 {
     MEM;
-    return mem->get_first()->get_mem();
+    void *m = mem->get_first()->get_mem();
+    std::cout << "start = " << m << "\n";
+    return m;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -434,6 +436,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 {
     MEM;
     STX;
+    // const char *src = (const char *)source;
+    // if (src < (const void *)0x1000)
+    // {
+    //     src += (size_t)mem->get_first()->get_mem();
+    // }
     mem->read(stx, (const char *)source, (char *)target, size);
     return true;
 }
