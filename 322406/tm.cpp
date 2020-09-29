@@ -36,6 +36,7 @@
 #include <map>
 #include <algorithm>
 #include <iostream>
+#include <thread>
 
 // Internal headers
 #include <tm.hpp>
@@ -68,273 +69,179 @@
 
 // -------------------------------------------------------------------------- //
 
-class blocking_memory
+std::atomic_size_t global_lock;
+
+template <typename value_t>
+class stx
 {
 public:
-    blocking_memory(size_t size) : mx(new std::mutex()), size(size), mem(new char[size]) {}
-
-    ~blocking_memory()
+    stx()
     {
-        delete[] mem;
-        delete mx;
+        reads.reserve(100);
     }
 
-    void memcpy_read(const char *offset, char *dst, size_t len)
-    {
-        mx->lock();
-        memcpy(dst, offset, len);
-        mx->unlock();
-    }
-
-    void memcpy_write(char *offset, const char *src, size_t len)
-    {
-        mx->lock();
-        memcpy(offset, src, len);
-        mx->unlock();
-    }
-
-    char *get_mem() { return mem; }
-    size_t get_size() { return size; }
-
-    void acquire() { mx->lock(); }
-    void release() { mx->unlock(); }
-
-private:
-    std::mutex *mx;
-    size_t size;
-
-    // TODO implement free
-    char *mem;
-};
-
-class stm_log_bloc
-{
 public:
-    stm_log_bloc(blocking_memory *orig, size_t size, size_t align)
-        : reads(size / align),
-          writes(size / align),
-          orig(orig),
-          r_value(new char[size]),
-          w_value(new char[size]),
-          size(size),
-          align(align)
-
+    void begin()
     {
-    }
-
-    ~stm_log_bloc()
-    {
-        // delete[] r_value;
-        // delete[] w_value;
-    }
-
-    bool contains(char *ptr) const
-    {
-        return ptr >= orig->get_mem() && ptr < (char *)orig->get_mem() + size;
-    }
-
-    void read(const char *from, char *to, size_t len)
-    {
-        // std::cout << "read(" << to << ", " << from << ", " << len << ")\n";
-        size_t offset = (char *)from - (char *)orig->get_mem();
-
-        for (size_t i = 0, j = offset / align; i < len; i += align, j++)
+        do
         {
-            if (writes[j])
-            {
-                memcpy(r_value + offset + i, w_value + offset + i, align);
-                continue;
-            }
-            if (!reads[j])
-            {
-                orig->memcpy_read(from + i, r_value + offset + i, align);
-                reads[j] = true;
-            }
+            snapshot = global_lock.load();
+        } while (snapshot & 1);
+    }
+
+    std::pair<bool, value_t> read(value_t *address)
+    {
+        auto it = writes.find(address);
+        if (it != writes.end())
+        {
+            // std::cout << "[" << std::this_thread::get_id() << " " << (void *)this << "] "
+            //           << "bueno\n";
+            return std::make_pair(true, it->second);
         }
 
-        memcpy(to, r_value + offset, len);
-    }
-
-    void write(char *to, const char *from, size_t len)
-    {
-        size_t offset = (char *)to - (char *)orig->get_mem();
-        // std::cout << "write(" << to << ", " << from << ", " << len << ", offset=" << offset << "/" << size << ")\n";
-
-        for (size_t i = 0, j = offset / align; i < len; i += align, j++)
-            writes[j] = true;
-
-        memcpy(w_value + offset, from, len);
-    }
-
-    bool start_commit()
-    {
-        orig->acquire();
-
-        // check that reads and writes are consistent
-
-        for (size_t i = 0, j = 0; i < size; i += align, j++)
+        auto val = *address;
+        while (snapshot != global_lock.load())
         {
-            if (reads[j])
-            {
-                if (memcmp(r_value + i, orig->get_mem() + i, align))
-                {
-                    orig->release();
-                    return false;
-                }
-            }
+            auto rv = validate();
+            if (!rv.first)
+                return std::make_pair(false, 0);
+            snapshot = rv.second;
+            val = *address;
         }
 
-        return true;
+        reads.push_back(std::make_pair(address, val));
+        // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] " << "read(" << address << ") -> " << val << "\n";
+        return std::make_pair(true, val);
     }
 
-    void rollback()
+    void write(value_t *address, value_t value)
     {
-        orig->release();
-    }
-
-    void commit()
-    {
-        for (size_t i = 0, j = 0; i < size; i += align, j++)
-        {
-            if (writes[j])
-                memcpy(orig->get_mem() + i, w_value + i, align);
-        }
-        orig->release();
-    }
-
-    std::vector<bool> reads, writes;
-    blocking_memory *orig;
-    char *r_value;
-    char *w_value;
-    size_t size, align;
-};
-
-class transaction
-{
-public:
-    transaction(size_t align) : _align(align) {}
-    ~transaction()
-    {
-        for (auto &&var : _vars)
-        {
-            delete var.second;
-        }
-    }
-    void read(blocking_memory *mem, const char *from, char *to, size_t len)
-    {
-        auto it = _vars.find(mem);
-        if (it == _vars.end())
-        {
-            auto bloc = new stm_log_bloc(mem, mem->get_size(), _align);
-            it = _vars.emplace(mem, bloc).first;
-        }
-
-        it->second->read(from, to, len);
-    }
-
-    void write(blocking_memory *mem, const char *from, char *to, size_t len)
-    {
-        auto it = _vars.find(mem);
-        if (it == _vars.end())
-        {
-            auto bloc = new stm_log_bloc(mem, mem->get_size(), _align);
-            it = _vars.emplace(mem, bloc).first;
-        }
-
-        it->second->write(to, from, len);
+        // std::cout << "[" << std::this_thread::get_id() << " " << (void *)this << "] "
+        //           << "write(" << address << ", " << value << ")\n";
+        writes.insert_or_assign(address, value);
     }
 
     bool commit()
     {
-        std::vector<stm_log_bloc *> acquired;
-        bool all_ack = true;
-        for (auto &&var : _vars)
+        if (writes.empty())
+            return true;
+
+        size_t exp = snapshot;
+        while (!global_lock.compare_exchange_strong(exp, snapshot + 1))
         {
-            if (!var.second->start_commit())
+            auto rv = validate();
+            if (!rv.first)
             {
-                all_ack = false;
-                break;
+                return false;
             }
-            else
-                acquired.push_back(var.second);
+            snapshot = rv.second;
+            exp = snapshot;
         }
 
-        if (!all_ack)
+        for (auto const &[addr, val] : writes)
         {
-            for (auto &&var : acquired)
-            {
-                var->rollback();
-            }
-            return false;
+            // std::cout << "[" << std::this_thread::get_id() << " " << (void *)this << "] "
+            //           << "commit_write(" << addr << ", " << val << ")\n";
+            *addr = val;
         }
 
-        for (auto &&var : acquired)
-        {
-            var->commit();
-        }
+        global_lock.store(snapshot + 2);
         return true;
     }
 
 private:
-    std::map<blocking_memory *, stm_log_bloc *> _vars;
-    size_t _align;
-};
-
-class transactional_mem
-{
-public:
-    transactional_mem(size_t align) : align(align)
+    std::pair<bool, size_t> validate()
     {
-    }
-
-    ~transactional_mem()
-    {
-        for (auto &&bloc : _blocks)
+        while (true)
         {
-            delete bloc.second;
+            size_t time = global_lock.load();
+            if (time & 1)
+                continue;
+
+            for (auto const &read : reads)
+                if (*(read.first) != read.second)
+                    return std::make_pair(false, 0);
+
+            if (time == global_lock.load())
+                return std::make_pair(true, time);
         }
     }
 
-    blocking_memory *alloc(size_t size)
+private:
+    size_t snapshot;
+    std::vector<std::pair<value_t *, value_t>> reads;
+    std::map<value_t *, value_t> writes;
+};
+
+typedef stx<uint64_t> transaction;
+
+template <typename value_t>
+class stm
+{
+public:
+    stm(size_t align) : align(align)
     {
-        auto bloc = new blocking_memory(size);
-        _blocks.emplace(bloc->get_mem(), bloc);
+    }
+
+    uint8_t *alloc(size_t size)
+    {
+        auto bloc = new uint8_t[size + 8];
+        memset(bloc, 0, size + 8);
+        *(size_t *)bloc = size;
+        // _blocks.emplace(bloc, bloc);
         return bloc;
     }
 
-    void read(transaction *tx, const char *from, char *to, size_t len)
+    bool read(transaction *tx, const value_t *from, value_t *to, size_t len)
     {
-        auto it = _blocks.lower_bound(from);
-        if (it == _blocks.end())
+        auto ptr = from;
+        auto tptr = to;
+        for (; ptr < from + len; ptr += align, tptr += align)
         {
-            std::cout << "oh noz\n";
+            auto rv = tx->read((value_t *)ptr);
+            if (!rv.first)
+                return false;
+
+            // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] "
+            //           << "we got " << rv.second << "\n";
+            *(volatile value_t *)tptr = rv.second;
+            // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] "
+            //           << "we made " << *(value_t *)tptr << "\n";
         }
-        tx->read(it->second, from, to, len);
+        return true;
     }
 
-    void write(transaction *tx, const char *from, char *to, size_t len)
+    bool write(transaction *tx, const value_t *from, value_t *to, size_t len)
     {
-        auto it = _blocks.lower_bound(to);
-        if (it == _blocks.end())
+        auto ptr = from;
+        auto tptr = to;
+        // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] " << "tx->write(" << (void *)from << ", " << (void *)to << ", " << len << ")\n";
+
+        for (; ptr < from + len; ptr += align, tptr += align)
         {
-            std::cout << "oh noz\n";
+            tx->write(tptr, *ptr);
         }
-        tx->write(it->second, from, to, len);
+        return true;
     }
 
     void alloc_first(size_t size)
     {
         first = alloc(size);
+        first_size = size;
     }
 
-    blocking_memory *get_first() { return first; }
+    void *get_first() { return first; }
+    size_t get_first_size() { return first_size; }
     size_t get_align() { return align; }
 
 private:
-    std::map<const char *, blocking_memory *, std::greater<const char *>> _blocks;
+    // std::map<const char *, void *, std::greater<const char *>> _blocks;
     size_t align;
-    blocking_memory *first;
+    size_t first_size;
+    void *first;
 };
+
+typedef stm<uint64_t> transactional_mem;
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -344,7 +251,7 @@ private:
 shared_t
 tm_create(size_t size, size_t align) noexcept
 {
-    std::cout << "create memory\n";
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] " << "create memory\n";
     auto mem = new transactional_mem(align);
     mem->alloc_first(size);
     return (shared_t)mem;
@@ -370,8 +277,8 @@ void tm_destroy(shared_t shared) noexcept
 void *tm_start(shared_t shared) noexcept
 {
     MEM;
-    void *m = mem->get_first()->get_mem();
-    std::cout << "start = " << m << "\n";
+    void *m = mem->get_first();
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] " << "start = " << m << "\n";
     return m;
 }
 
@@ -382,7 +289,7 @@ void *tm_start(shared_t shared) noexcept
 size_t tm_size(shared_t shared) noexcept
 {
     MEM;
-    return mem->get_first()->get_size();
+    return mem->get_first_size();
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -404,7 +311,8 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept
 {
     (void)is_ro;
     MEM;
-    auto stx = new transaction(mem->get_align());
+    auto stx = new transaction();
+    stx->begin();
     return (tx_t)stx;
 }
 
@@ -415,12 +323,24 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept
 **/
 bool tm_end(shared_t shared, tx_t tx) noexcept
 {
+    // static int num_succ = 0;
+    // static int num_failed = 0;
     (void)shared;
     STX;
-    // std::cout << "commit start\n";
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void *)tx << "] "
+    //           << "commit start\n";
     auto success = stx->commit();
-    // std::cout << "commit: " << success << "\n";
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void *)tx << "] "
+    //           << "commit: " << (success ? "ok" : "abort") << "\n";
     delete stx;
+    // if (!success)
+    // {
+    //     std::cout << num_succ << " / " << num_failed++ << " execution\r";
+    // }
+    // else
+    // {
+    //     std::cout << num_succ++ << " / " << num_failed << " execution\r";
+    // }
     return success;
 }
 
@@ -441,8 +361,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     // {
     //     src += (size_t)mem->get_first()->get_mem();
     // }
-    mem->read(stx, (const char *)source, (char *)target, size);
-    return true;
+    auto rv = mem->read(stx, (const uint64_t *)source, (uint64_t *)target, size);
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void *)tx << "] "
+    //           << "read(" << source << ") -> " << *(uint64_t *)target
+    //           << " [" << (rv ? "ok" : "abort") << "]\n";
+    return rv;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -457,8 +380,11 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 {
     MEM;
     STX;
-    mem->write(stx, (const char *)source, (char *)target, size);
-    return true;
+    auto rv = mem->write(stx, (const uint64_t *)source, (uint64_t *)target, size);
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void *)tx << "] "
+    //           << "write(" << target << ", " << *(const volatile uint64_t *)source << ")"
+    //           << " [" << (rv ? "ok" : "abort") << "]\n";
+    return rv;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -470,11 +396,11 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 **/
 Alloc tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) noexcept
 {
-    std::cout << "alloc(<< " << size << " <<)\n";
     MEM;
     (void)tx;
-    *target = mem->alloc(size)->get_mem();
-    return Alloc::success;
+    *target = mem->alloc(size);
+    // std::cout << "[" << std::this_thread::get_id() << " " << (void*)this << "] " << "alloc(" << size << ") -> [" << *target << ", " << (void *)(((uintptr_t)*target) + size) << "]\n";
+    return *target != nullptr ? Alloc::success : Alloc::nomem;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
