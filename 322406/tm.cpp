@@ -74,11 +74,6 @@ std::atomic_size_t global_lock;
 template <typename value_t>
 class stx
 {
-public:
-    stx()
-    {
-        reads.reserve(100);
-    }
 
 public:
     void begin()
